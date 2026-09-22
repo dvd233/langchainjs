@@ -1,10 +1,11 @@
 import {
   callToolWithElicitation,
-  type InterruptMCPClient,
+  type ElicitationRoundParams,
 } from "./elicitation.js";
 import { ToolException, isToolException } from "./utils/errors.js";
 import { z } from "zod";
 import {
+  CLIENT_CAPABILITIES_META_KEY,
   fromJsonSchema,
   LOG_LEVEL_META_KEY,
 } from "@modelcontextprotocol/client";
@@ -20,6 +21,7 @@ import type {
   CallToolRequestOptions,
   CallToolResult,
   ContentBlock as MCPContentBlock,
+  InputRequiredResult,
   Client as MCPClient,
   Tool as MCPTool,
   RequestOptions,
@@ -342,14 +344,16 @@ type ContentBlocksWithArtifacts = [
 type ToolInputSchema = z.ZodTransform<ToolArguments, ToolArguments>;
 
 type ToolRound = (
-  params: CallToolRequest["params"],
+  params: ElicitationRoundParams,
   options: CallToolRequestOptions
-) => Promise<CallToolResult>;
+) => Promise<CallToolResult | InputRequiredResult>;
 
 interface ToolInvocation {
-  /** Rounds budget when this connection answers elicitation in band. */
-  readonly elicitationRounds?: number;
-  /** Fork for these headers once, then run every round against the result. */
+  /** True when this connection answers elicitation through graph interrupts. */
+  readonly elicitation: boolean;
+  /** Withheld from the rounds, so the terminal result is validated here. */
+  readonly outputSchema?: MCPTool["outputSchema"];
+  /** Resolve the runtime binding only when a wire round executes. */
   bind(headers: ToolCallModification["headers"]): Promise<ToolRound>;
 }
 
@@ -373,55 +377,75 @@ function createToolInvocationFactory(
   client: MCPInstance,
   serverName: string,
   descriptor: MCPTool,
-  logLevel?: LoggingLevel
+  logLevel?: LoggingLevel,
+  elicitation = false
 ): () => ToolInvocation {
   const modern = client.getProtocolEra() === "modern";
+  // Legacy servers answer elicitation through `onElicitation`, never in band.
+  const inBand = modern && elicitation;
+
+  // An `input_required` round carries no structured content, which the SDK's
+  // output validator rejects before the caller can see the question. Withhold
+  // the schema from the rounds and validate the terminal result here instead.
+  const { outputSchema, ...withoutOutputSchema } = descriptor;
+  const roundDefinition =
+    inBand && outputSchema ? withoutOutputSchema : descriptor;
 
   function executor(connectedClient: MCPInstance, modernProtocol: boolean) {
-    const metadata =
-      logLevel !== undefined && modernProtocol
+    const inBandHere = inBand && modernProtocol;
+    const metadata = {
+      ...(logLevel !== undefined && modernProtocol
         ? { [LOG_LEVEL_META_KEY]: logLevel }
-        : undefined;
+        : {}),
+      // Advertised per request rather than as a declared capability: declared
+      // capabilities are sent during initialization, before negotiation settles
+      // the era, so an `auto` connection landing on legacy would advertise
+      // elicitation to a server that must not see it. A user-supplied `_meta`
+      // key takes precedence over the SDK's auto-attached envelope.
+      ...(inBandHere
+        ? {
+            [CLIENT_CAPABILITIES_META_KEY]: {
+              elicitation: { form: {}, url: {} },
+            },
+          }
+        : {}),
+    };
 
     return (
-      request: CallToolRequest["params"],
+      request: ElicitationRoundParams,
       options: CallToolRequestOptions
     ) => {
-      const params = { ...request, _meta: metadata };
+      const params = {
+        ...request,
+        _meta: Object.keys(metadata).length > 0 ? metadata : undefined,
+      };
 
+      // `callTool` deliberately does not widen its return type for
+      // `allowInputRequired`, so narrow with the SDK's own `isInputRequiredResult`.
       return connectedClient.callTool(params, {
         ...options,
-        toolDefinition: descriptor,
-      });
+        toolDefinition: roundDefinition,
+        ...(inBandHere ? { allowInputRequired: true } : {}),
+      }) as Promise<CallToolResult | InputRequiredResult>;
     };
   }
 
   const unbound = executor(client, modern);
 
-  // Structural, not `instanceof`: duplicate module copies would break identity.
-  const rounds = (client as Partial<InterruptMCPClient>).maxElicitationRounds;
-  const elicitationRounds =
-    modern && typeof rounds === "number" ? rounds : undefined;
-
-  /**
-   * Dynamic headers are applied per execution through the client's own fork.
-   *
-   * Graph calls are not treated differently: `beforeToolCall` runs again on
-   * every replayed execution, so the headers it returns are recomputed for that
-   * execution rather than restored from a checkpoint. Nothing about a forked
-   * client's credentials is persisted between executions.
-   */
+  /** Header-bound clients remain runtime resources, never checkpointed state. */
   function selectHeaderPolicy() {
     if ("fork" in client && typeof client.fork === "function") {
       const fork = client.fork.bind(client);
 
       return async (headers: NonNullable<ToolCallModification["headers"]>) => {
         const connectedClient = await fork(headers);
+        const connectedModern = connectedClient.getProtocolEra() === "modern";
+        if (connectedModern !== modern)
+          throw new ToolException(
+            `MCP connection for server "${serverName}" changed protocol era after tool discovery.`
+          );
 
-        return executor(
-          connectedClient,
-          connectedClient.getProtocolEra() === "modern"
-        );
+        return executor(connectedClient, connectedModern);
       };
     }
 
@@ -433,7 +457,8 @@ function createToolInvocationFactory(
   }
 
   return () => ({
-    elicitationRounds,
+    elicitation: inBand,
+    outputSchema: inBand ? outputSchema : undefined,
     async bind(headers: ToolCallModification["headers"]) {
       if (headers && Object.keys(headers).length > 0)
         return selectHeaderPolicy()(headers);
@@ -441,6 +466,45 @@ function createToolInvocationFactory(
       return unbound;
     },
   });
+}
+
+/**
+ * Validate structured output the SDK was not given a schema for.
+ *
+ * Elicitation rounds withhold `outputSchema` from `callTool`, whose validator
+ * rejects an `input_required` round for carrying no structured content. The
+ * terminal result still has to satisfy the server's own contract.
+ */
+async function assertStructuredOutput({
+  schema,
+  result,
+  serverName,
+  toolName,
+}: {
+  schema?: MCPTool["outputSchema"];
+  result: CallToolResult;
+  serverName: string;
+  toolName: string;
+}): Promise<void> {
+  if (schema === undefined || result.isError) return;
+
+  if (result.structuredContent === undefined)
+    throw new ToolException(
+      `MCP tool "${toolName}" on server "${serverName}" has an output schema but returned no structured content.`
+    );
+
+  // Scope the SDK engine to this descriptor: its shared cache keys by $id.
+  const validator = fromJsonSchema(schema, new DefaultJsonSchemaValidator());
+  const parsed = await validator["~standard"].validate(
+    result.structuredContent
+  );
+
+  if (parsed.issues)
+    throw new ToolException(
+      `MCP tool "${toolName}" on server "${serverName}" returned structured content that does not match its output schema: ${parsed.issues
+        .map((issue) => issue.message)
+        .join("; ")}`
+    );
 }
 
 /** Keep the SDK's JSON Schema semantics while exposing a Zod parsing boundary. */
@@ -578,21 +642,28 @@ async function _callTool(
   try {
     const graph = graphTaskState(config);
     const prepared = await prepareToolCall({ ...call, graph });
-    const execute = await invocation.bind(prepared.headers);
+    const round = async (params: ElicitationRoundParams) => {
+      config?.signal?.throwIfAborted();
+      const execute = await invocation.bind(prepared.headers);
+      config?.signal?.throwIfAborted();
+      return execute(params, prepared.requestOptions);
+    };
 
-    const round = (params: CallToolRequest["params"]) =>
-      execute(params, prepared.requestOptions);
+    const result = invocation.elicitation
+      ? await callToolWithElicitation(round, prepared.request, {
+          server: serverName,
+          tool: toolName,
+          direct: graph === undefined,
+          signal: config?.signal,
+        })
+      : ((await round(prepared.request)) as CallToolResult);
 
-    const result =
-      invocation.elicitationRounds === undefined
-        ? await round(prepared.request)
-        : await callToolWithElicitation(round, prepared.request, {
-            server: serverName,
-            tool: toolName,
-            maxRounds: invocation.elicitationRounds,
-            direct: graph === undefined,
-            signal: config?.signal,
-          });
+    await assertStructuredOutput({
+      schema: invocation.outputSchema,
+      result,
+      serverName,
+      toolName,
+    });
 
     const { args: finalArgs, state } = prepared;
 
@@ -702,7 +773,8 @@ export async function convertMcpTools(
               client,
               serverName,
               tool,
-              options?.logLevel
+              options?.logLevel,
+              options?.elicitation
             );
 
             return new DynamicStructuredTool({

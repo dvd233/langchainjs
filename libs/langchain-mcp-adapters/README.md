@@ -69,6 +69,76 @@ to skip probing and enable legacy options such as `onElicitation` and
 [`2026-07-28`](https://modelcontextprotocol.io/specification/2026-07-28)
 without fallback. SDK 2 can serve either protocol.
 
+## Modern elicitation
+
+Modern servers can return `input_required` from a tool call. Opt a server in
+with `elicitation: true`; inside a LangGraph with a checkpointer the adapter
+raises the form or URL question as an `interrupt()`. Legacy `onElicitation`
+callbacks remain separate and do not become graph interrupts.
+
+```ts
+const adapter = new MCPAdapter({
+  servers: { modern: { url: "http://localhost:8000/mcp", elicitation: true } },
+});
+```
+
+Resume using the latest interrupt and the same thread:
+
+```ts
+import { Command, INTERRUPT, isInterrupted } from "@langchain/langgraph";
+import {
+  createMCPElicitationResume,
+  type MCPElicitationInterrupt,
+} from "@langchain/mcp-adapters";
+
+const paused = await agent.invoke(input, config);
+
+if (isInterrupted<MCPElicitationInterrupt>(paused)) {
+  const [pending] = paused[INTERRUPT];
+
+  await agent.invoke(
+    new Command({
+      resume: createMCPElicitationResume(pending, {
+        confirmation: { action: "accept", content: { confirmed: true } },
+      }),
+    }),
+    config
+  );
+}
+```
+
+Here `agent`, `input`, and `config` are application-owned; `confirmation` and
+`confirmed` must match the server's input-request key and form schema. Answers
+are parsed against the server's requested schema, and the resume carries the
+`questionId` of the question the human saw. A missing, unexpected, or malformed
+answer fails the tool call rather than re-asking: the caller resuming the graph
+is code, not the human who filled the form.
+
+`questionId` is derived from the question's content and the call's effective
+arguments, so it changes if the server asks something different on resume — the
+same keys and schema but "approve $1,000" instead of "approve $10" — or if
+`beforeToolCall` resolves different arguments. The saved answer is then refused
+rather than applied to an operation nobody agreed to.
+
+### Resuming replays the call
+
+Resuming re-issues the tool call from its first round, so the server is asked
+again before it is answered and each round trip costs one extra request. A
+server that asks before doing work repeats nothing; one that works first repeats
+that work. Remote effects must be idempotent.
+
+Because the call is replayed rather than restored, the server always issues a
+fresh continuation, so a pause cannot outlive a `requestState` lifetime. Nothing
+about the pending question is checkpointed beyond the interrupt payload itself,
+and that payload carries the server's questions but never its opaque
+continuation state.
+
+`beforeToolCall` runs once per execution, replays included, so any header
+identity it supplies is re-derived on resume rather than reused from the pause.
+`afterToolCall` is not an exactly-once transaction. An application request or
+other external event must invoke resume: a paused thread is stored data, not a
+worker waiting in memory.
+
 ## Configuration and lifecycle
 
 Construction validates options with Zod 4 and opens no connections. Discovery

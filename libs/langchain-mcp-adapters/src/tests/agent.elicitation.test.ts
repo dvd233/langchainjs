@@ -67,7 +67,9 @@ async function environment(toolCalls?: ToolCall[][]) {
   const server: AgentMcpServer = await startAgentMcpServer();
   cleanups.push(() => server.close());
 
-  const adapter = new MCPAdapter({ servers: { modern: { url: server.url } } });
+  const adapter = new MCPAdapter({
+    servers: { modern: { url: server.url, elicitation: true } },
+  });
   cleanups.push(() => adapter.close());
 
   const agent = createAgent({
@@ -107,68 +109,15 @@ function resuming(resume: MCPElicitationResume): AgentInput {
   return new Command({ resume }) as unknown as AgentInput;
 }
 
-describe("replay on resume", () => {
-  it("replays the initial request, then answers it with that response's state", async () => {
-    const { agent, server, config } = await environment();
-
-    const first = await agent.invoke(input, config);
-    // Nothing is answered yet: one request, paused on the question.
-    expect(server.calls).toEqual([{ tool: "ask", label: "q", round: 0 }]);
-
-    await agent.invoke(
-      resuming(createMCPElicitationResume(onlyInterrupt(first), accept())),
-      config
-    );
-
-    // Resuming re-runs the tool node from the top: the initial request is
-    // issued again, and only then is the answered follow-up sent, carrying the
-    // requestState returned by the response this execution just replayed.
-    expect(server.calls).toEqual([
-      { tool: "ask", label: "q", round: 0 },
-      { tool: "ask", label: "q", round: 0 },
-      { tool: "ask", label: "q", round: 1, action: "accept" },
-    ]);
-    expect(server.completed).toEqual([{ label: "q", action: "accept" }]);
-  });
-
-  it("replays earlier answered rounds across a multi-round elicitation", async () => {
-    const { agent, server, config } = await environment([
-      [{ id: "c1", name: "ask", args: { label: "r", rounds: 2 } }],
-      [],
-    ]);
-
-    const first = await agent.invoke(input, config);
-    const second = await agent.invoke(
-      resuming(createMCPElicitationResume(onlyInterrupt(first), accept())),
-      config
-    );
-    await agent.invoke(
-      resuming(createMCPElicitationResume(onlyInterrupt(second), accept())),
-      config
-    );
-
-    // The second resume replays round 0 and round 1 before reaching round 2.
-    // Pre-elicitation work repeats; the adapter promises no exactly-once
-    // effects. Each round's state comes from the response preceding it in the
-    // same execution, so the rounds still advance 0 -> 1 -> 2.
-    expect(server.calls).toEqual([
-      { tool: "ask", label: "r", round: 0 },
-      { tool: "ask", label: "r", round: 0 },
-      { tool: "ask", label: "r", round: 1, action: "accept" },
-      { tool: "ask", label: "r", round: 0 },
-      { tool: "ask", label: "r", round: 1, action: "accept" },
-      { tool: "ask", label: "r", round: 2, action: "accept" },
-    ]);
-    expect(server.completed).toEqual([{ label: "r", action: "accept" }]);
-  });
-});
-
 describe("answer validation", () => {
-  it("re-interrupts with a validation error, then accepts a correction", async () => {
+  it("fails the call when an answer violates the requested schema", async () => {
     const { agent, server, config } = await environment();
 
     const first = await agent.invoke(input, config);
-    const corrected = await agent.invoke(
+
+    // Re-asking would not help: the caller resuming the graph is code, not the
+    // human who filled the form, so the same question would come back wrong.
+    const failed = await agent.invoke(
       resuming(
         createMCPElicitationResume(onlyInterrupt(first), {
           // `confirm` is declared boolean by the server's requestedSchema.
@@ -178,36 +127,19 @@ describe("answer validation", () => {
       config
     );
 
-    // The malformed answer never reaches the server: the replayed initial
-    // request is the only call it saw.
-    expect(server.calls).toEqual([
-      { tool: "ask", label: "q", round: 0 },
-      { tool: "ask", label: "q", round: 0 },
-    ]);
-    expect(onlyInterrupt(corrected).value).toMatchObject({
-      type: "mcp_elicitation",
-      validationError: expect.stringContaining("must be boolean"),
-    });
-
-    await agent.invoke(
-      resuming(createMCPElicitationResume(onlyInterrupt(corrected), accept())),
-      config
+    expect(mcpInterrupts(failed)).toHaveLength(0);
+    expect(JSON.stringify(failed.messages)).toContain(
+      "data/confirm must be boolean"
     );
-
-    expect(server.calls.at(-1)).toEqual({
-      tool: "ask",
-      label: "q",
-      round: 1,
-      action: "accept",
-    });
-    expect(server.completed).toEqual([{ label: "q", action: "accept" }]);
+    expect(server.completed).toEqual([]);
   });
 
-  it("rejects an answer under the wrong request key", async () => {
+  it("fails the call for an answer under the wrong request key", async () => {
     const { agent, config } = await environment();
 
     const first = await agent.invoke(input, config);
-    const retried = await agent.invoke(
+
+    const failed = await agent.invoke(
       resuming(
         createMCPElicitationResume(onlyInterrupt(first), {
           wrong: { action: "accept", content: { confirm: true } },
@@ -216,9 +148,10 @@ describe("answer validation", () => {
       config
     );
 
-    expect(onlyInterrupt(retried).value).toMatchObject({
-      validationError: expect.any(String),
-    });
+    expect(mcpInterrupts(failed)).toHaveLength(0);
+    expect(JSON.stringify(failed.messages)).toContain(
+      "needs answers built by createMCPElicitationResume()"
+    );
   });
 });
 
@@ -277,6 +210,7 @@ describe("end to end over stdio", () => {
             "tsx",
             join(__dirname, "fixtures", "modern-stdio-server.ts"),
           ],
+          elicitation: true,
         },
       },
     });
@@ -305,8 +239,6 @@ describe("end to end over stdio", () => {
       config
     );
 
-    // The fixture echoes the action, and throws unless the replayed round
-    // carried its `requestState` back unchanged.
     expect(toolOutput(done)).toContain("accept");
   });
 
@@ -354,5 +286,45 @@ describe("end to end over stdio", () => {
     expect(mcpInterrupts(done)).toHaveLength(0);
     expect(onElicitation).toHaveBeenCalledTimes(1);
     expect(toolOutput(done)).toContain("accept");
+  });
+});
+
+describe("multiple sequential rounds", () => {
+  it("answers each question and replays the answered ones", async () => {
+    const { agent, server, config } = await environment([
+      [{ id: "c1", name: "ask", args: { label: "q", rounds: 2 } }],
+      [],
+    ]);
+
+    const first = await agent.invoke(input, config);
+    expect(mcpInterrupts(first)).toHaveLength(1);
+
+    const second = await agent.invoke(
+      resuming(createMCPElicitationResume(onlyInterrupt(first), accept())),
+      config
+    );
+    expect(mcpInterrupts(second)).toHaveLength(1);
+
+    const done = await agent.invoke(
+      resuming(createMCPElicitationResume(onlyInterrupt(second), accept())),
+      config
+    );
+
+    expect(mcpInterrupts(done)).toHaveLength(0);
+    expect(server.completed).toEqual([{ label: "q", action: "accept" }]);
+
+    // Both questions carry the same message, so they share a questionId. The
+    // answers still land in order, because LangGraph matches resumes to
+    // `interrupt()` calls positionally within the task — and two questions
+    // with identical content have interchangeable answers anyway.
+    //
+    // Each resume replays every answered round before reaching the new one,
+    // so N questions cost O(N^2) requests. This is the price of not
+    // checkpointing the server's continuation.
+    expect(
+      server.calls
+        .filter((call) => call.tool === "ask")
+        .map((call) => call.round)
+    ).toEqual([0, 0, 1, 0, 1, 2]);
   });
 });
