@@ -1,5 +1,11 @@
 # @langchain/openai
 
+## 1.5.14
+
+### Patch Changes
+
+- [#11625](https://github.com/langchain-ai/langchainjs/pull/11625) [`fb13e5d`](https://github.com/langchain-ai/langchainjs/commit/fb13e5d9b3f4da853973c4ac0be199dada20f94d) Thanks [@chiliec](https://github.com/chiliec)! - Recognize gpt-6 models as reasoning models so explicit `reasoning` config is forwarded.
+
 ## 1.5.13
 
 ### Patch Changes
