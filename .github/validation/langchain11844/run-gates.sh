@@ -34,6 +34,29 @@ PY
 }
 trap finish EXIT
 
+# Diagnostic-only revision: collect fixed, read-only process/network metadata
+# before any isolation assertion. This does not establish isolation success.
+printf '%s\n' 'DIAGNOSTIC ONLY: native gates will not run in this revision.'
+python3 -I - "$OUT" <<'PYDIAGNOSTICS'
+import json, os, pathlib, sys
+out=pathlib.Path(sys.argv[1])
+paths={'process_status':'/proc/self/status','network_devices':'/proc/net/dev','ipv4_routes':'/proc/net/route','ipv6_routes':'/proc/net/ipv6_route'}
+raw={};errors={}
+for label,path in paths.items():
+    try:
+        raw[label]=pathlib.Path(path).read_text()
+        (out/f'preflight-{label}.txt').write_text(raw[label])
+    except OSError as error:
+        errors[label]=str(error)
+record={'stage':'before_isolation_assertions','diagnostic_only':True,'isolation_accepted':False,'host_namespace':os.environ.get('HOST_NETWORK_NAMESPACE'),'runtime_namespace':os.readlink('/proc/self/ns/net'),'uid':os.getuid(),'gid':os.getgid(),'groups':os.getgroups(),'raw':raw,'read_errors':errors}
+if 'ipv4_routes' in raw:
+    record['ipv4_splitlines']=raw['ipv4_routes'].splitlines()
+    record['ipv4_line_count']=len(record['ipv4_splitlines'])
+    record['ipv4_nonblank_line_count']=sum(bool(line.strip()) for line in record['ipv4_splitlines'])
+(out/'preflight-diagnostics.json').write_text(json.dumps(record,indent=2)+'\n')
+print(json.dumps(record,indent=2))
+PYDIAGNOSTICS
+
 # The workflow must establish a new kernel network namespace before this script.
 [[ -n "${HOST_NETWORK_NAMESPACE:-}" ]]
 CURRENT_NAMESPACE=$(readlink /proc/self/ns/net)
@@ -58,6 +81,9 @@ record={'uid':os.getuid(),'gid':os.getgid(),'supplementary_groups':os.getgroups(
 (out/'runtime-isolation.json').write_text(json.dumps(record,indent=2)+'\n')
 print(json.dumps(record,indent=2))
 PYSECURITY
+# Even if isolation passes in this diagnostic run, stop before product commands.
+printf '%s\n' 'Diagnostic preflight completed; native gates intentionally not executed.'
+exit 78
 python3 -I "$HARNESS/verify-source.py" "$SOURCE" "$SOURCE_SHA" "$HARNESS/approved-source.json" "$OUT/source-offline-start.json" initial
 node --version > "$OUT/node-version.txt"
 pnpm --version > "$OUT/pnpm-version.txt"
