@@ -1,0 +1,124 @@
+name: Validate LangChain 11844 approved source
+
+on:
+  push:
+    branches:
+      - validation/langchain-tool-error-11844
+
+permissions:
+  contents: read
+
+concurrency:
+  group: langchain11844-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-offline-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: 114ce0ee3257df915ccdbfe2599165b22e3b524e
+      HARNESS_SHA: ${{ github.sha }}
+      AUTHORIZED_FORK: dvd233/langchainjs
+      IS_FORK: ${{ github.event.repository.fork }}
+    steps:
+      - name: Fail closed unless pushed to the authorized validation branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == push ]]
+          [[ "$GITHUB_REF" == refs/heads/validation/langchain-tool-error-11844 ]]
+          [[ "$GITHUB_REPOSITORY" == "$AUTHORIZED_FORK" && "$IS_FORK" == true ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout immutable validation harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # parent-verified v4
+        with:
+          ref: ${{ github.sha }}
+          path: harness
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout exact reviewed source separately
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # parent-verified v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify source and harness identities before executing source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          [[ "$(git -C harness rev-parse HEAD)" == "$HARNESS_SHA" ]]
+          python3 -I harness/.github/validation/langchain11844/verify-source.py \
+            source "$SOURCE_SHA" \
+            harness/.github/validation/langchain11844/approved-source.json \
+            artifacts/source-before.json initial
+          printf '%s\n' "$HARNESS_SHA" > artifacts/harness-sha.txt
+          git -C harness rev-parse 'HEAD^{tree}' > artifacts/harness-tree.txt
+          {
+            printf '%s\0' harness/.github/workflows/langchain11844-validation.yml
+            find harness/.github/validation/langchain11844 -type f -print0
+          } | sort -z | xargs -0 sha256sum > artifacts/harness-files.sha256
+
+      - name: Set up the source repository's pinned Node version
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # parent-verified v4
+        with:
+          node-version-file: source/.nvmrc
+
+      - name: Acquire pinned tooling and frozen dependencies without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/acquisition-home" "$RUNNER_TEMP/runtime-home" "$RUNNER_TEMP/pnpm-tool" "$RUNNER_TEMP/pnpm-store"
+          : > "$RUNNER_TEMP/empty.npmrc"
+          : > "$RUNNER_TEMP/empty.env"
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/acquisition-home" CI=1 \
+            NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/empty.npmrc" \
+            npm install --registry=https://registry.npmjs.org --prefix "$RUNNER_TEMP/pnpm-tool" --ignore-scripts --no-audit --no-fund pnpm@10.14.0 \
+            > artifacts/tool-install.log 2>&1
+          export PATH="$RUNNER_TEMP/pnpm-tool/node_modules/.bin:$PATH"
+          [[ "$(pnpm --version)" == 10.14.0 ]]
+          printf '%s\n' "$RUNNER_TEMP/pnpm-tool/node_modules/.bin" >> "$GITHUB_PATH"
+          (
+            cd source
+            env -i PATH="$PATH" HOME="$RUNNER_TEMP/acquisition-home" CI=1 \
+              NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/empty.npmrc" \
+              pnpm --filter langchain... --filter @langchain/build --filter langchainjs \
+              install --registry=https://registry.npmjs.org --frozen-lockfile --ignore-scripts --store-dir "$RUNNER_TEMP/pnpm-store"
+          ) > artifacts/dependency-install.log 2>&1
+
+      - name: Run native gates with no network namespace routes or credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST_NAMESPACE="$(readlink /proc/self/ns/net)"
+          sudo -n /usr/bin/unshare --net -- /usr/bin/setpriv \
+            --reuid="$(id -u)" --regid=65534 --clear-groups \
+            --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
+            env -i PATH="$PATH" HOME="$RUNNER_TEMP/runtime-home" CI=1 \
+            SOURCE_SHA="$SOURCE_SHA" HARNESS_SHA="$HARNESS_SHA" \
+            HOST_NETWORK_NAMESPACE="$HOST_NAMESPACE" EXPECTED_RUNTIME_UID="$(id -u)" \
+            LANGCHAIN_TRACING=false LANGCHAIN_TRACING_V2=false \
+            LANGSMITH_TRACING=false LANGSMITH_TRACING_V2=false \
+            TURBO_TELEMETRY_DISABLED=1 DO_NOT_TRACK=1 \
+            GOMAXPROCS=4 RAYON_NUM_THREADS=4 \
+            NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/empty.npmrc" \
+            DOTENV_CONFIG_PATH="$RUNNER_TEMP/empty.env" \
+            NODE_OPTIONS="--require=$GITHUB_WORKSPACE/harness/.github/validation/langchain11844/network-guard.cjs" \
+            NETWORK_AUDIT_LOG="$GITHUB_WORKSPACE/artifacts/network-audit.jsonl" \
+            bash "$GITHUB_WORKSPACE/harness/.github/validation/langchain11844/run-gates.sh" \
+              "$GITHUB_WORKSPACE/source" "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Retain source-bound evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # parent-verified v4
+        with:
+          name: langchain11844-${{ env.SOURCE_SHA }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14

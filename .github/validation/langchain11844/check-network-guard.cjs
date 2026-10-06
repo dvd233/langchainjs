@@ -1,0 +1,12 @@
+const assert = require('node:assert/strict');
+const { Worker } = require('node:worker_threads');
+const { spawnSync } = require('node:child_process');
+const http = require('node:http');
+assert.throws(() => http.get('https://example.invalid'), /NETWORK_DISABLED_BY_VALIDATION/);
+const child = spawnSync(process.execPath, ['-e', `require('node:assert/strict').throws(() => require('node:net').connect(443, 'example.invalid'), /NETWORK_DISABLED_BY_VALIDATION/); console.log('child process guarded');`], { encoding:'utf8' });
+assert.equal(child.status, 0, child.stderr);
+process.stdout.write(child.stdout);
+const worker = new Worker(`const assert = require('node:assert/strict'); assert.throws(() => require('node:https').get('https://example.invalid'), /NETWORK_DISABLED_BY_VALIDATION/); require('node:worker_threads').parentPort.postMessage('worker thread guarded');`, { eval: true });
+worker.on('message', console.log);
+worker.on('error', (err) => { console.error(err); process.exitCode = 1; });
+worker.on('exit', (code) => { assert.equal(code,0); console.log('main process guarded; no credentials; no real network calls made'); });

@@ -1,0 +1,21 @@
+{
+  "base_sha": "5dfb0cbbe4d1a2bd43627a905796450b761c0c79",
+  "approved_patch_sha256": "3b58e69420c232b9e14b4a2c53ea3325bb366c15d075e957884bc08c4677796a",
+  "approved_files": {
+    ".changeset/bright-tools-recover.md": "e6ca659af1c0fdd0d52519e59a98942af7a216767fc094a1c18b6b29f042e49b",
+    "libs/langchain/src/agents/index.ts": "799d879d7c9d8d1cad5b047b720a7095a001ef695c3d1ec3238dff1ef1c76611",
+    "libs/langchain/src/agents/middleware/tests/toolError.test.ts": "b751122d3fc77c9b5d0f56bac23eb93c9a1945d0859a9c13df66102d147a1104",
+    "libs/langchain/src/agents/middleware/toolError.ts": "0573a65f6725dc5cb4c55a4792c59aad93ebf6893cb9cfd62d3c0abd99101a46",
+    "libs/langchain/src/agents/middleware/toolErrorContext.ts": "5ded33e57053a403bb4840b701ad0dc7b3ef07e4156bfda52466684815d63571",
+    "libs/langchain/src/agents/middleware/toolRetry.ts": "3b135804665453f3d67cd036b2ad5c5100fe4220bfa2e1b98b264cc9a485969c",
+    "libs/langchain/src/agents/nodes/ToolNode.ts": "ebb6022e791f45106297e608f05654427546ab3e433e89310607765492fc3cef",
+    "libs/langchain/src/agents/tests/middlewareErrorHandling.test.ts": "0222fb7f6fb7456512c2dcecab01f1ad80e0279239441ddb59787945d969ef8e",
+    "libs/langchain/src/agents/tests/toolErrorProvenance.test-d.ts": "0bb377cfae1b8b246312622a499e02420ece345d61256d93f5d9e9cd5d620a4e",
+    "libs/langchain/src/agents/tests/toolErrorProvenance.test.ts": "66ac301fcf1f6a704b7c3360d07232ff24efbc66d74cbaa9ff547724ec0c6ab9",
+    "libs/langchain/src/agents/utils.ts": "24e93031842471208b0872e6106243334f3114a62a086b049e1ccc4b33d3eaaf"
+  },
+  "remote_source_sha": "114ce0ee3257df915ccdbfe2599165b22e3b524e",
+  "expected_file_count": 11,
+  "remote_source_tree": "c9dbccb5eb024cd4797c78a4c4199894b9a877f9",
+  "canonical_diff_sha256": "fe1650022f81db319d6b3b73366468f398a29edeaad212ec7ef338edd970a615"
+}
