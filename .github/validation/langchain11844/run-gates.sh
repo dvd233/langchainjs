@@ -34,9 +34,9 @@ PY
 }
 trap finish EXIT
 
-# Diagnostic-only revision: collect fixed, read-only process/network metadata
-# before any isolation assertion. This does not establish isolation success.
-printf '%s\n' 'DIAGNOSTIC ONLY: native gates will not run in this revision.'
+# Retain read-only preflight evidence before any isolation assertion.
+# Capturing this data does not establish isolation success.
+printf '%s\n' 'PREFLIGHT SNAPSHOT: native gates require all isolation checks to pass.'
 python3 -I - "$OUT" <<'PYDIAGNOSTICS'
 import json, os, pathlib, sys
 out=pathlib.Path(sys.argv[1])
@@ -48,7 +48,7 @@ for label,path in paths.items():
         (out/f'preflight-{label}.txt').write_text(raw[label])
     except OSError as error:
         errors[label]=str(error)
-record={'stage':'before_isolation_assertions','diagnostic_only':True,'isolation_accepted':False,'host_namespace':os.environ.get('HOST_NETWORK_NAMESPACE'),'runtime_namespace':os.readlink('/proc/self/ns/net'),'uid':os.getuid(),'gid':os.getgid(),'groups':os.getgroups(),'raw':raw,'read_errors':errors}
+record={'stage':'before_isolation_assertions','diagnostic_only':False,'isolation_accepted':False,'host_namespace':os.environ.get('HOST_NETWORK_NAMESPACE'),'runtime_namespace':os.readlink('/proc/self/ns/net'),'uid':os.getuid(),'gid':os.getgid(),'groups':os.getgroups(),'raw':raw,'read_errors':errors}
 if 'ipv4_routes' in raw:
     record['ipv4_splitlines']=raw['ipv4_routes'].splitlines()
     record['ipv4_line_count']=len(record['ipv4_splitlines'])
@@ -72,18 +72,25 @@ assert status['NoNewPrivs']=='1'
 assert all(int(status[key],16)==0 for key in ['CapInh','CapPrm','CapEff','CapBnd','CapAmb'])
 interfaces=[line.split(':',1)[0].strip() for line in pathlib.Path('/proc/net/dev').read_text().splitlines() if ':' in line]
 assert interfaces==['lo'], interfaces
-assert len(pathlib.Path('/proc/net/route').read_text().splitlines())==1, 'IPv4 routes are present'
+def require_empty_ipv4_table(raw):
+    # The hosted runner produced an exactly empty proc table. Other kernels
+    # expose the known header with no route rows. No data row is permitted.
+    if raw == '':
+        return 'empty'
+    lines=raw.splitlines()
+    header=['Iface','Destination','Gateway','Flags','RefCnt','Use','Metric','Mask','MTU','Window','IRTT']
+    assert lines and lines[0].split()==header, 'Unrecognized nonempty IPv4 route table'
+    assert all(not line.strip() for line in lines[1:]), 'IPv4 routes are present'
+    return 'header_only'
+ipv4_table_format=require_empty_ipv4_table(pathlib.Path('/proc/net/route').read_text())
 ipv6=pathlib.Path('/proc/net/ipv6_route')
 assert not ipv6.exists() or all(line.split()[-1]=='lo' for line in ipv6.read_text().splitlines()), 'Non-loopback IPv6 route'
 for sock in ['/var/run/docker.sock','/run/containerd/containerd.sock','/run/podman/podman.sock',f'/run/user/{os.getuid()}/docker.sock',f'/run/user/{os.getuid()}/podman/podman.sock']:
     assert not os.access(sock,os.W_OK), f'Privileged daemon socket accessible: {sock}'
-record={'uid':os.getuid(),'gid':os.getgid(),'supplementary_groups':os.getgroups(),'no_new_privs':1,'capabilities':{key:status[key] for key in ['CapInh','CapPrm','CapEff','CapBnd','CapAmb']},'interfaces':interfaces,'ipv4_routes':0,'ipv6_external_routes':0}
+record={'uid':os.getuid(),'gid':os.getgid(),'supplementary_groups':os.getgroups(),'no_new_privs':1,'capabilities':{key:status[key] for key in ['CapInh','CapPrm','CapEff','CapBnd','CapAmb']},'interfaces':interfaces,'ipv4_routes':0,'ipv4_table_format':ipv4_table_format,'ipv6_external_routes':0}
 (out/'runtime-isolation.json').write_text(json.dumps(record,indent=2)+'\n')
 print(json.dumps(record,indent=2))
 PYSECURITY
-# Even if isolation passes in this diagnostic run, stop before product commands.
-printf '%s\n' 'Diagnostic preflight completed; native gates intentionally not executed.'
-exit 78
 python3 -I "$HARNESS/verify-source.py" "$SOURCE" "$SOURCE_SHA" "$HARNESS/approved-source.json" "$OUT/source-offline-start.json" initial
 node --version > "$OUT/node-version.txt"
 pnpm --version > "$OUT/pnpm-version.txt"
